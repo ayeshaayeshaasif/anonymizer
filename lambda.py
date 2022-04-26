@@ -9,9 +9,12 @@ import requests
 from typing import Dict
 import io
 import boto3
+import math
 
 
 
+s3_bucket_name = "my-test-bucket-name"
+s3 = boto3.client('s3', aws_access_key_id="test", aws_secret_access_key="test")
 weights_path = './weights'
 kernel_size, sigma, box_kernel_size = 21,2,9
 obfuscator = Obfuscator(kernel_size=int(kernel_size), sigma=float(sigma), box_kernel_size=int(box_kernel_size))
@@ -25,15 +28,12 @@ detection_thresholds = {
 }
 
 def handler(event: events.APIGatewayProxyEventV2, context: context_.Context) -> responses.APIGatewayProxyResponseV2:
-    print(event["body"], event)
     try:
-        # parse input & do validation
         input: RequestBody = json.loads(event["body"])
     except:
         return respond_with_error("Invalid json", status=400)
 
     try:
-        # download input image & convert to np array
         image = Image.open(requests.get(input["url"], stream=True).raw).convert('RGB')
     except:
         return respond_with_error("Error loading image", status=500)
@@ -43,7 +43,14 @@ def handler(event: events.APIGatewayProxyEventV2, context: context_.Context) -> 
     split_height = 2500
 
     X_points = start_points(image.width, split_width, overlap=0.1)
-    Y_points = start_points(image.height, split_height, overlap=0.1, region_of_interest=[2500, 4500])
+
+    # for equirrectangular panoramas, we can ignore the upper and lower thirds
+    if math.floor(image.width / image.height) == 2:
+        roi_start = math.floor(image.height * 0.4)
+        roi_stop = math.floor(image.height * 0.75)
+        Y_points = start_points(image.height, split_height, overlap=0.1, region_of_interest=[roi_start, roi_stop])
+    else:
+        Y_points = start_points(image.height, split_height, overlap=0.1)
 
 
     coords = []
@@ -71,9 +78,10 @@ def handler(event: events.APIGatewayProxyEventV2, context: context_.Context) -> 
     
     result_url = None
 
-    # if (len(detections)):
-        # generate unique name and store as that
-        # result_url = save_np_image(anonymized_image, "path-to-upload-to-blablabla")
+    if (len(detections)):
+        np_image = np.array(image)
+        obfuscated_np_image = obfuscator.obfuscate(np_image, detections)
+        result_url = upload_image_to_s3(obfuscated_np_image, image.format)
 
     return respond({
         "detections": list(map(lambda box: { 
@@ -85,7 +93,7 @@ def handler(event: events.APIGatewayProxyEventV2, context: context_.Context) -> 
             "kind": box.kind,
          }, detections)),
         "result_url": result_url,
-        "meta": input["meta"],
+        "meta": input["meta"], # passthrough any meta fields for convenience
     }, status=200)
 
 def respond_with_error(message: str, status: int = 400) -> responses.APIGatewayProxyResponseV2:
@@ -109,22 +117,28 @@ def load_np_image(image_url: str) -> np.ndarray:
     return np_image
 
 
-def save_np_image(image, image_path):
-    # pil_image = Image.fromarray((image).astype(np.uint8), mode='RGB')
-    # pil_image.save(image_path)
+def upload_image_to_s3(image, format) -> str:
+    obfuscated_image = Image.fromarray((image).astype(np.uint8), mode='RGB')
     in_mem_file = io.BytesIO()
-    image.save(in_mem_file, format=image.format)
+    obfuscated_image.save(in_mem_file, format=format)
     in_mem_file.seek(0)
 
-    s3 = boto3.client('s3', aws_access_key_id="test", aws_secret_access_key="test")
+    import uuid
+    object_name = str(uuid.uuid4())
+
     s3.upload_fileobj(
-        in_mem_file, # This is what i am trying to upload
-        "my-test-bucket-name",
-        "the-path-to-the-file or the key of the object as its called",
+        in_mem_file,
+        s3_bucket_name,
+        object_name,
         ExtraArgs={
             'ACL': 'public-read'
         }
     )
+
+    return s3.generate_presigned_url('get_object', Params={
+        "Bucket": s3_bucket_name,
+        "Key": object_name
+    }, ExpiresIn=3600)
 
 def start_points(size, split_size, overlap=0, region_of_interest=None):
     offset = 0

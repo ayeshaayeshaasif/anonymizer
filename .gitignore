@@ -3,3 +3,4 @@ __pycache__
 /.venv
 /images
 /images-anonymized
+.DS_Store
